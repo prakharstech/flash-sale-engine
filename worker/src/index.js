@@ -1,71 +1,80 @@
 const amqp = require('amqplib');
 const { Pool } = require('pg');
-const Redis = require('ioredis'); // New dependency
+const Redis = require('ioredis');
+const express = require('express'); // For metrics server
+const client = require('prom-client');
 
-// Database Connection
-const pool = new Pool({
-    connectionString: 'postgresql://user:password@postgres:5432/flashsale'
+// --- MONITORING SETUP ---
+const app = express(); // Tiny server just for metrics
+const orderProcessedCounter = new client.Counter({
+    name: 'flashsale_orders_processed_total',
+    help: 'Total orders processed by worker',
+    labelNames: ['status'] // 'confirmed', 'failed', 'locked'
 });
 
-// Redis Connection (The Gatekeeper)
-const redis = new Redis({
-    host: 'redis', // Docker service name
-    port: 6379
+const stockGauge = new client.Gauge({
+    name: 'flashsale_stock_level',
+    help: 'Current stock level of products',
+    labelNames: ['product_id']
 });
+// ------------------------
+
+const pool = new Pool({ connectionString: 'postgresql://user:password@postgres:5432/flashsale' });
+const redis = new Redis({ host: 'redis', port: 6379 });
 
 const RABBITMQ_URL = 'amqp://rabbitmq:5672';
 const QUEUE_NAME = 'order_queue';
 
 async function processOrder(order) {
-    const client = await pool.connect();
-    // Unique Lock Key: Only one worker can process this PRODUCT at a time
-    const lockKey = `lock:product:${order.productId}`; 
-    const lockValue = order.userId; // Who owns the lock?
-    const lockTTL = 5000; // 5 seconds expiry (prevent deadlocks)
+    const clientDB = await pool.connect();
+    const lockKey = `lock:product:${order.productId}`;
+    const lockTTL = 5000;
 
     try {
-        // --- STEP 1: DISTRIBUTED LOCK ACQUISITION ---
-        // "SET if Not eXists" (NX) with Expiry (PX)
-        // If this returns 'OK', we have the lock. If null, someone else is busy.
-        const acquiredLock = await redis.set(lockKey, lockValue, 'NX', 'PX', lockTTL);
+        const acquiredLock = await redis.set(lockKey, order.userId, 'NX', 'PX', lockTTL);
 
         if (!acquiredLock) {
-            console.log(`🔒 Product ${order.productId} is busy. Re-queueing order for ${order.userId}...`);
-            throw new Error('LOCKED'); // Throwing error will cause RabbitMQ to re-queue it
+            orderProcessedCounter.inc({ status: 'locked' }); // Metric
+            console.log(`🔒 Product ${order.productId} is busy. Re-queueing...`);
+            throw new Error('LOCKED');
         }
 
-        // --- STEP 2: DATABASE TRANSACTION ---
-        await client.query('BEGIN');
-        
-        const productRes = await client.query('SELECT stock FROM products WHERE id = $1', [order.productId]);
+        await clientDB.query('BEGIN');
+        const productRes = await clientDB.query('SELECT stock FROM products WHERE id = $1', [order.productId]);
         const product = productRes.rows[0];
 
+        // Update Gauge
+        stockGauge.set({ product_id: order.productId }, product.stock);
+
         if (product.stock >= order.quantity) {
-            await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [order.quantity, order.productId]);
-            await client.query('INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)', [order.userId, order.productId, order.quantity, 'CONFIRMED']);
-            await client.query('COMMIT');
+            await clientDB.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [order.quantity, order.productId]);
+            await clientDB.query('INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)', [order.userId, order.productId, order.quantity, 'CONFIRMED']);
+            await clientDB.query('COMMIT');
+            
+            // Metrics
+            stockGauge.dec({ product_id: order.productId }, order.quantity);
+            orderProcessedCounter.inc({ status: 'confirmed' });
+            
             console.log(`✅ Order Confirmed for User ${order.userId}`);
         } else {
-            await client.query('INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)', [order.userId, order.productId, order.quantity, 'FAILED']);
-            await client.query('COMMIT');
+            await clientDB.query('INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)', [order.userId, order.productId, order.quantity, 'FAILED']);
+            await clientDB.query('COMMIT');
+            
+            // Metrics
+            stockGauge.set({ product_id: order.productId }, 0);
+            orderProcessedCounter.inc({ status: 'failed' });
+            
             console.log(`❌ Out of Stock for User ${order.userId}`);
         }
 
     } catch (err) {
-        await client.query('ROLLBACK');
-        
-        // If it was just a lock contention, we re-throw so RabbitMQ tries again later
+        await clientDB.query('ROLLBACK');
         if (err.message === 'LOCKED') throw err;
-        
-        console.error(`⚠️ System Error: ${err.message}`);
+        console.error(`⚠️ Error: ${err.message}`);
     } finally {
-        // --- STEP 3: RELEASE LOCK ---
-        // Only release if WE were the ones who set it (Lua script is better for this, but this is okay for MVP)
         const currentLock = await redis.get(lockKey);
-        if (currentLock === lockValue) {
-            await redis.del(lockKey);
-        }
-        client.release();
+        if (currentLock === order.userId) await redis.del(lockKey);
+        clientDB.release();
     }
 }
 
@@ -76,7 +85,7 @@ async function startWorker() {
         await channel.assertQueue(QUEUE_NAME, { durable: true });
         channel.prefetch(1);
 
-        console.log("👷 Worker (Redis-Powered) waiting for messages...");
+        console.log("👷 Worker waiting for messages...");
 
         channel.consume(QUEUE_NAME, async (msg) => {
             if (msg !== null) {
@@ -86,10 +95,9 @@ async function startWorker() {
                     channel.ack(msg);
                 } catch (err) {
                     if (err.message === 'LOCKED') {
-                        // If locked, wait 1s and put back in queue (NACK with requeue)
-                        setTimeout(() => channel.nack(msg, false, true), 1000); 
+                        setTimeout(() => channel.nack(msg, false, true), 1000);
                     } else {
-                        channel.ack(msg); // Discard bad data
+                        channel.ack(msg);
                     }
                 }
             }
@@ -98,5 +106,12 @@ async function startWorker() {
         setTimeout(startWorker, 5000);
     }
 }
+
+// Start Metrics Server on Port 3001 (Internal use)
+app.get('/metrics', async (req, res) => {
+    res.set('Content-Type', client.register.contentType);
+    res.end(await client.register.metrics());
+});
+app.listen(3001, () => console.log('📊 Worker Metrics running on port 3001'));
 
 startWorker();
