@@ -1,15 +1,15 @@
 const amqp = require('amqplib');
 const { Pool } = require('pg');
 const Redis = require('ioredis');
-const express = require('express'); // For metrics server
+const express = require('express'); 
 const client = require('prom-client');
 
 // --- MONITORING SETUP ---
-const app = express(); // Tiny server just for metrics
+const app = express();
 const orderProcessedCounter = new client.Counter({
     name: 'flashsale_orders_processed_total',
     help: 'Total orders processed by worker',
-    labelNames: ['status'] // 'confirmed', 'failed', 'locked'
+    labelNames: ['status']
 });
 
 const stockGauge = new client.Gauge({
@@ -20,7 +20,7 @@ const stockGauge = new client.Gauge({
 // ------------------------
 
 const pool = new Pool({ connectionString: 'postgresql://user:password@postgres:5432/flashsale' });
-const redis = new Redis({ host: 'redis', port: 6379 });
+const redis = new Redis({ host: 'redis', port: 6379 }); // Fixed variable name
 
 const RABBITMQ_URL = 'amqp://rabbitmq:5672';
 const QUEUE_NAME = 'order_queue';
@@ -28,22 +28,28 @@ const QUEUE_NAME = 'order_queue';
 async function processOrder(order) {
     const clientDB = await pool.connect();
     const lockKey = `lock:product:${order.productId}`;
-    const lockTTL = 5000;
+    const lockTTL = 10000; 
 
     try {
+        // Attempt to acquire distributed lock
         const acquiredLock = await redis.set(lockKey, order.userId, 'NX', 'PX', lockTTL);
 
         if (!acquiredLock) {
-            orderProcessedCounter.inc({ status: 'locked' }); // Metric
+            orderProcessedCounter.inc({ status: 'locked' });
             console.log(`🔒 Product ${order.productId} is busy. Re-queueing... ${order.userId}`);
             throw new Error('LOCKED');
         }
 
+        // START TRANSACTION
         await clientDB.query('BEGIN');
+        
         const productRes = await clientDB.query('SELECT stock FROM products WHERE id = $1', [order.productId]);
-        const product = productRes.rows[0];
+        
+        if (productRes.rows.length === 0) {
+            throw new Error('Product not found');
+        }
 
-        // Update Gauge
+        const product = productRes.rows[0];
         stockGauge.set({ product_id: order.productId }, product.stock);
 
         if (product.stock >= order.quantity) {
@@ -51,29 +57,32 @@ async function processOrder(order) {
             await clientDB.query('INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)', [order.userId, order.productId, order.quantity, 'CONFIRMED']);
             await clientDB.query('COMMIT');
             
-            // Metrics
             stockGauge.dec({ product_id: order.productId }, order.quantity);
             orderProcessedCounter.inc({ status: 'confirmed' });
-            
             console.log(`✅ Order Confirmed for User ${order.userId}`);
         } else {
             await clientDB.query('INSERT INTO orders (user_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)', [order.userId, order.productId, order.quantity, 'FAILED']);
             await clientDB.query('COMMIT');
             
-            // Metrics
             stockGauge.set({ product_id: order.productId }, 0);
             orderProcessedCounter.inc({ status: 'failed' });
-            
             console.log(`❌ Out of Stock for User ${order.userId}`);
         }
 
     } catch (err) {
-        await clientDB.query('ROLLBACK');
+        // Only rollback if we actually started a transaction (avoid "no transaction in progress" warning)
+        if (err.message !== 'LOCKED') {
+            await clientDB.query('ROLLBACK');
+        }
+        
         if (err.message === 'LOCKED') throw err;
         console.error(`⚠️ Error: ${err.message}`);
     } finally {
+        // Release the lock if this worker owns it
         const currentLock = await redis.get(lockKey);
-        if (currentLock === order.userId) await redis.del(lockKey);
+        if (currentLock === order.userId) {
+            await redis.del(lockKey);
+        }
         clientDB.release();
     }
 }
@@ -95,23 +104,26 @@ async function startWorker() {
                     channel.ack(msg);
                 } catch (err) {
                     if (err.message === 'LOCKED') {
-                        setTimeout(() => channel.nack(msg, false, true), 1000);
+                        // Requeue with a slight delay
+                        setTimeout(() => channel.nack(msg, false, true), 500); 
                     } else {
-                        channel.ack(msg);
+                        channel.ack(msg); 
                     }
                 }
             }
         });
     } catch (error) {
+        console.log("RabbitMQ connection failed, retrying...", error);
         setTimeout(startWorker, 5000);
     }
 }
 
-// Start Metrics Server on Port 3001 (Internal use)
+// Metrics endpoint
 app.get('/metrics', async (req, res) => {
     res.set('Content-Type', client.register.contentType);
     res.end(await client.register.metrics());
 });
+
 app.listen(3001, () => console.log('📊 Worker Metrics running on port 3001'));
 
 startWorker();
