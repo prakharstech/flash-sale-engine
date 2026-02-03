@@ -35,7 +35,7 @@ async function processOrder(order) {
 
         if (!acquiredLock) {
             orderProcessedCounter.inc({ status: 'locked' }); // Metric
-            console.log(`🔒 Product ${order.productId} is busy. Re-queueing...`);
+            console.log(`🔒 Product ${order.productId} is busy. Re-queueing... ${order.userId}`);
             throw new Error('LOCKED');
         }
 
