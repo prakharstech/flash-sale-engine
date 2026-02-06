@@ -112,6 +112,8 @@ A stress test script is included to simulate concurrent traffic.
     ```
     This sends 20 concurrent buy requests for Product ID 1.
 
+---
+
 ## 📊 Monitoring
 The project includes a pre-configured monitoring stack.
 
@@ -124,6 +126,8 @@ The project includes a pre-configured monitoring stack.
 * **flashsale_stock_level:** Current stock for products.
 
 * **flashsale_orders_processed_total:** Counts of confirmed, failed, or locked attempts.
+
+---
 
 ## 📂 Project Structure
 
@@ -142,6 +146,8 @@ The project includes a pre-configured monitoring stack.
 ├── stress_test.sh        # Load testing script
 └── .gitignore
 ```
+
+---
 
 ## 🛡️ License
 ISC
