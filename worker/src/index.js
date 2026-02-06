@@ -20,12 +20,23 @@ const stockGauge = new client.Gauge({
 // ------------------------
 
 const pool = new Pool({ connectionString: 'postgresql://user:password@postgres:5432/flashsale' });
-const redis = new Redis({ host: 'redis', port: 6379 }); // Fixed variable name
+const redis = new Redis({ host: 'redis', port: 6379 }); 
 
 const RABBITMQ_URL = 'amqp://rabbitmq:5672';
 const QUEUE_NAME = 'order_queue';
 
 async function processOrder(order) {
+    // 1. IDEMPOTENCY CHECK (Start)
+    // If the order has a key and we have already seen it, stop immediately.
+    if (order.idempotencyKey) {
+        const processedKey = `processed:${order.idempotencyKey}`;
+        const alreadyProcessed = await redis.get(processedKey);
+        if (alreadyProcessed) {
+            console.log(`🔁 Duplicate Message Ignored: ${order.idempotencyKey}`);
+            return; // Exit function, the worker will ACK this message and move on
+        }
+    }
+
     const clientDB = await pool.connect();
     const lockKey = `lock:product:${order.productId}`;
     const lockTTL = 10000; 
@@ -67,6 +78,13 @@ async function processOrder(order) {
             stockGauge.set({ product_id: order.productId }, 0);
             orderProcessedCounter.inc({ status: 'failed' });
             console.log(`❌ Out of Stock for User ${order.userId}`);
+        }
+
+        // 2. IDEMPOTENCY SAVE (End)
+        // Mark this key as processed so we never do it again.
+        if (order.idempotencyKey) {
+            // Expire in 24 hours (86400 seconds) to save Redis memory
+            await redis.set(`processed:${order.idempotencyKey}`, 'true', 'EX', 86400);
         }
 
     } catch (err) {

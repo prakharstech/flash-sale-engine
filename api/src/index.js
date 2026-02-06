@@ -49,7 +49,7 @@ app.post('/buy', async (req, res) => {
         return res.status(400).json({ error: "Missing fields" });
     }
 
-    const orderData = { userId, productId, quantity, timestamp: Date.now() };
+    const orderData = { userId, productId, quantity, timestamp: Date.now(), idempotencyKey: req.headers['idempotency-key'] || `gen_${Date.now()}_${userId}` };
 
     channel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify(orderData)), {
         persistent: true

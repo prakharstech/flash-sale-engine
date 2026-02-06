@@ -1,9 +1,8 @@
 #!/bin/bash
-
+ 
 echo "🚀 Starting Flash Sale Simulation..."
 
-# Try to buy 10 times rapidly
-for i in {1..10}
+for i in {1..20}
 do
    curl -X POST http://localhost:3000/buy \
      -H "Content-Type: application/json" \
