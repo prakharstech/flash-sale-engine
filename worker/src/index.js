@@ -17,7 +17,7 @@ const stockGauge = new client.Gauge({
     help: 'Current stock level of products',
     labelNames: ['product_id']
 });
-// ------------------------
+
 
 const pool = new Pool({ connectionString: 'postgresql://user:password@postgres:5432/flashsale' });
 const redis = new Redis({ host: 'redis', port: 6379 }); 

@@ -28,7 +28,7 @@ services:
     depends_on: [postgres, redis, rabbitmq]
     # ports: ["3001:3001"]  <-- REMOVE THIS LINE
     deploy:
-      replicas: 3
+      replicas: 10
 
   prometheus:
     image: prom/prometheus

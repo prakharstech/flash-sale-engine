@@ -4,4 +4,4 @@ global:
 scrape_configs:
   - job_name: 'flash_sale_services'
     static_configs:
-      - targets: ['api:3000', 'worker:3001'] # Docker service names
+      - targets: ['api:3000', 'worker:3001']
